@@ -45,6 +45,19 @@ CLOSE_COMMAND = [0x05]
 SIZE_COMMAND = [0x06]
 
 
+def run_command_with_retry(connection, data):
+    tries = 10
+    while tries:
+        tries -= 1
+        try:
+            return connection.xraw_command(
+                netfn=IMM_NETFN, command=IMM_COMMAND, data=data)
+        except pygexc.IpmiException as e:
+            if e.ipmicode != 0xa or not tries:
+                raise
+            connection.ipmi_session.pause(1)
+
+
 def _convert_syntax(raw):
     return raw.replace('!', 'not').replace('||', 'or').replace(
         '&&', 'and').replace('-', '_')
@@ -103,11 +116,14 @@ class _ExpEngine(object):
 def _eval_conditional(expression, cfg, setting):
     if not expression:
         return False, ()
-    parsed = ast.parse(expression)
-    parsed = parsed.body[0].value
-    evaluator = _ExpEngine(cfg, setting)
-    result = evaluator.process(parsed)
-    return result, evaluator.relatedsettings
+    try:
+        parsed = ast.parse(expression)
+        parsed = parsed.body[0].value
+        evaluator = _ExpEngine(cfg, setting)
+        result = evaluator.process(parsed)
+        return result, evaluator.relatedsettings
+    except SyntaxError:
+        return False, ()
 
 
 class LenovoFirmwareConfig(object):
@@ -124,8 +140,7 @@ class LenovoFirmwareConfig(object):
         for i in range(len(filename)):
             data += [ord(filename[i])]
 
-        response = self.connection.xraw_command(netfn=IMM_NETFN,
-                                                command=IMM_COMMAND, data=data)
+        response = run_command_with_retry(self.connection, data=data)
 
         size = response['data'][3:7]
 
@@ -153,15 +168,12 @@ class LenovoFirmwareConfig(object):
 
         while retries:
             retries = retries-1
-            response = self.connection.xraw_command(netfn=IMM_NETFN,
-                                                    command=IMM_COMMAND,
-                                                    data=data)
+            response = run_command_with_retry(self.connection, data=data)
             try:
                 if response['code'] == 0 or retries == 0:
                     break
             except KeyError:
                 pass
-
             self.connection.ipmi_session.pause(5)
         filehandle = response['data'][3:7]
         filehandle = struct.unpack("<I", filehandle)[0]
@@ -177,8 +189,7 @@ class LenovoFirmwareConfig(object):
         for byte in hex_filehandle[:4]:
             data += [ord(byte)]
 
-        self.connection.xraw_command(netfn=IMM_NETFN,
-                                     command=IMM_COMMAND, data=data)
+        run_command_with_retry(self.connection, data=data)
 
     def imm_write(self, filehandle, size, inputdata):
         blocksize = 0xc8
@@ -204,8 +215,7 @@ class LenovoFirmwareConfig(object):
                 data += [ord(byte)]
             remaining -= blocksize
             offset += blocksize
-            self.connection.xraw_command(netfn=IMM_NETFN, command=IMM_COMMAND,
-                                         data=data)
+            run_command_with_retry(self.connection, data=data)
 
     def imm_read(self, filehandle, size):
         blocksize = 0xc8
@@ -232,9 +242,7 @@ class LenovoFirmwareConfig(object):
             remaining -= blocksize
             offset += blocksize
 
-            response = self.connection.xraw_command(netfn=IMM_NETFN,
-                                                    command=IMM_COMMAND,
-                                                    data=data)
+            response = run_command_with_retry(self.connection, data=data)
             output += response['data'][5:]
 
         return output
@@ -268,6 +276,8 @@ class LenovoFirmwareConfig(object):
             if lenovo_id == 'iSCSI':
                 # Do not support iSCSI at this time
                 continue
+            cfglabel = config.find('mriName')
+            cfglabel = lenovo_id if cfglabel is None else cfglabel.text
             for group in config.iter("group"):
                 lenovo_group = group.get("ID")
                 for setting in group.iter("setting"):
@@ -306,6 +316,7 @@ class LenovoFirmwareConfig(object):
                     ldata = setting.find("list_data")
                     extraorder = False
                     currentdict = {}
+                    currentdef = {}
                     if ldata is not None:
                         is_list = True
                         current = []
@@ -329,14 +340,26 @@ class LenovoFirmwareConfig(object):
                                         choice.find('value').text)
                                 except ValueError:
                                     lenovo_value = choice.find('value').text
-                        if choice.get("default") == "true":
+                        hasdefault = choice.get('default')
+                        if hasdefault == "true":
                             default = label
+                        elif hasdefault is not None:
+                            try:
+                                a = int(hasdefault)
+                                currentdef[a] = label
+                            except ValueError:
+                                pass
                         if choice.get("reset-required") == "true":
                             reset = True
                     if len(currentdict) > 0:
                         for order in sorted(currentdict):
                             current.append(currentdict[order])
-                    optionname = "%s.%s" % (lenovo_id, name)
+                    if len(currentdef) > 0:
+                        default = []
+                        for order in sorted(currentdef):
+                            default.append(currentdef[order])
+                    optionname = "%s.%s" % (cfglabel, name)
+                    alias = "%s.%s" % (lenovo_id, name)
                     options[optionname] = dict(current=current,
                                                default=default,
                                                possible=possible,
@@ -353,7 +376,8 @@ class LenovoFirmwareConfig(object):
                                                readonly_expression=readonly,
                                                hide_expression=hide,
                                                sortid=sortid,
-                                               lenovo_instance="")
+                                               lenovo_instance="",
+                                               alias=alias)
                     sortid = sortid + 1
         for opt in options:
             opt = options[opt]

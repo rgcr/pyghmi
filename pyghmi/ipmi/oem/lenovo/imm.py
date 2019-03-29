@@ -93,6 +93,7 @@ class IMMClient(object):
     ADP_URL = '/designs/imm/dataproviders/imm_adapters.php'
     ADP_NAME = 'adapter.adapterName'
     ADP_FUN = 'adapter.functions'
+    ADP_FU_URL = None
     ADP_LABEL = 'adapter.connectorLabel'
     ADP_SLOTNO = 'adapter.slotNo'
     ADP_OOB = 'adapter.oobSupported'
@@ -172,6 +173,10 @@ class IMMClient(object):
         self.fwovintage = util._monotonic_time()
         retcfg = {}
         for opt in self.fwo:
+            if 'MegaRAIDConfigurationTool' in opt:
+                # Suppress the Avago configuration to be consistent with
+                # other tools.
+                continue
             if (hideadvanced and self.fwo[opt]['lenovo_protect'] or
                     self.fwo[opt]['hidden']):
                 # Do not enumerate hidden settings
@@ -197,6 +202,11 @@ class IMMClient(object):
                     if fnmatch.fnmatch(rkey.lower(), key.lower()):
                         changeset[rkey] = changeset[key]
                         found = True
+                    elif self.fwo[rkey].get('alias', None) != rkey:
+                        calias = self.fwo[rkey]['alias']
+                        if fnmatch.fnmatch(calias.lower(), key.lower()):
+                            changeset[rkey] = changeset[key]
+                            found = True
                 if found:
                     del changeset[key]
                 else:
@@ -250,6 +260,21 @@ class IMMClient(object):
                 self.fwo = None
                 raise
 
+    def set_property(self, propname, value):
+        if not isinstance(value, int) or value > 255:
+            raise Exception('Unsupported property value')
+        propname = propname.encode('utf-8')
+        proplen = len(propname) | 0b10000000
+        valuelen = 0x11  # The value is always one byte, for now
+        cmdlen = len(propname) + 4 # the flags byte, two tlv bytes, and value
+        cdata = bytearray([3, 0, cmdlen, 1, proplen]) + propname
+        cdata += bytearray([valuelen, value])
+        rsp = self.ipmicmd.xraw_command(netfn=0x3a, command=0xc4, data=cdata)
+        rsp['data'] = bytearray(rsp['data'])
+        if rsp['data'][0] != 0:
+            raise Exception('Unknown response setting property: {0}'.format(
+                rsp['data'][0]))
+
     def get_property(self, propname):
         propname = propname.encode('utf-8')
         proplen = len(propname) | 0b10000000
@@ -268,6 +293,7 @@ class IMMClient(object):
     def get_webclient(self):
         cv = self.ipmicmd.certverify
         wc = webclient.SecureHTTPConnection(self.imm, 443, verifycallback=cv)
+        wc.vintage = None
         try:
             wc.connect()
         except socket.error as se:
@@ -301,7 +327,8 @@ class IMMClient(object):
 
     @property
     def wc(self):
-        if not self._wc:
+        if (not self._wc or (self._wc.vintage and
+                             self._wc.vintage < util._monotonic_time() - 30)):
             self._wc = self.get_webclient()
         return self._wc
 
@@ -422,8 +449,15 @@ class IMMClient(object):
                 raise Exception(result['reason'])
         self.weblogout()
 
+    def fetch_psu_firmware(self):
+        return []
+
     def fetch_agentless_firmware(self):
-        adapterdata = self.get_cached_data('lenovo_cached_adapters')
+        cd = self.get_cached_data('lenovo_cached_adapters_fu')
+        if cd:
+            adapterdata, fwu = cd
+        else:
+            adapterdata = None
         if not adapterdata:
             if self.updating:
                 raise pygexc.TemporaryError(
@@ -431,9 +465,14 @@ class IMMClient(object):
             if self.wc:
                 adapterdata = self.wc.grab_json_response(
                     self.ADP_URL, referer=self.adp_referer)
+                if self.ADP_FU_URL:
+                    fwu = self.wc.grab_json_response(self.ADP_FU_URL,
+                    referer=self.adp_referer)
+                else:
+                    fwu = None
                 if adapterdata:
-                    self.datacache['lenovo_cached_adapters'] = (
-                        adapterdata, util._monotonic_time())
+                    self.datacache['lenovo_cached_adapters_fu'] = (
+                        (adapterdata, fwu), util._monotonic_time())
         if adapterdata and 'items' in adapterdata:
             anames = {}
             for adata in adapterdata['items']:
@@ -466,6 +505,13 @@ class IMMClient(object):
                             except ValueError:
                                 pass
                         yield ('{0} {1}'.format(aname, fname), bdata)
+                for fwi in fwu.get('items'):
+                    if fwi.get('key', -1) == adata.get('key', -2):
+                        if fwi.get('fw_status', 0) == 2:
+                            bdata = {}
+                            if 'fw_version_pend' in fwi:
+                                bdata['version'] = fwi['fw_version_pend']
+                            yield('{0} Pending Update'.format(aname), bdata)
         for disk in self.disk_inventory():
             yield disk
         self.weblogout()
@@ -716,6 +762,7 @@ class XCCClient(IMMClient):
     ADP_URL = '/api/dataset/imm_adapters?params=pci_GetAdapters'
     ADP_NAME = 'adapterName'
     ADP_FUN = 'functions'
+    ADP_FU_URL = '/api/function/adapter_update?params=pci_GetAdapterListAndFW'
     ADP_LABEL = 'connectorLabel'
     ADP_SLOTNO = 'slotNo'
     ADP_OOB = 'oobSupported'
@@ -754,6 +801,7 @@ class XCCClient(IMMClient):
     def get_webclient(self, login=True):
         cv = self.ipmicmd.certverify
         wc = webclient.SecureHTTPConnection(self.imm, 443, verifycallback=cv)
+        wc.vintage = util._monotonic_time()
         try:
             wc.connect()
         except socket.error as se:
@@ -850,19 +898,34 @@ class XCCClient(IMMClient):
                         yield self.get_disk_firmware(diskent)
                     elif mode==1:
                         yield self.get_disk_hardware(diskent)
+                for diskent in adp.get('aimDisks', ()):
+                    if mode==0:
+                        yield self.get_disk_firmware(diskent)
+                    elif mode==1:
+                        yield self.get_disk_hardware(diskent)
+                if mode == 1:
+                    bdata = {'Description': 'Unmanaged Disk'}
+                    if adp.get('m2Type', -1) == 2:
+                        yield ('M.2 Disk', bdata)
+                    for umd in adp.get('unmanagedDisks', []):
+                        yield ('Disk {0}'.format(umd['slotNo']), bdata)
 
-    def get_disk_hardware(self, diskent):
+    def get_disk_hardware(self, diskent, prefix=''):
         bdata = {}
-        diskname = 'Disk {0}'.format(diskent['slotNo'])
+        if not prefix and diskent.get('location', '').startswith('M.2'):
+            prefix = 'M.2-'
+        diskname = 'Disk {1}{0}'.format(diskent['slotNo'], prefix)
         bdata['Model'] = diskent['productName'].rstrip()
         bdata['Serial Number'] = diskent['serialNo'].rstrip()
         bdata['FRU Number'] = diskent['fruPartNo'].rstrip()
         bdata['Description'] = diskent['type'].rstrip()
         return (diskname, bdata)
 
-    def get_disk_firmware(self, diskent):
+    def get_disk_firmware(self, diskent, prefix=''):
         bdata = {}
-        diskname = 'Disk {0}'.format(diskent['slotNo'])
+        if not prefix and diskent.get('location', '').startswith('M.2'):
+            prefix = 'M.2-'
+        diskname = 'Disk {1}{0}'.format(diskent['slotNo'], prefix)
         bdata['model'] = diskent[
             'productName'].rstrip()
         bdata['version'] = diskent['fwVersion']
@@ -961,10 +1024,10 @@ class XCCClient(IMMClient):
         rsp = self.wc.grab_json_response(
             '/api/function',
             {'raidlink_DiskStateAction': '{0},{1}'.format(disk.id[1], state)})
-        if rsp['return'] != 0:
+        if rsp.get('return', -1) != 0:
             raise Exception(
                 'Unexpected return to set disk state: {0}'.format(
-                    rsp['return']))
+                    rsp.get('return', -1)))
 
     def clear_storage_arrays(self):
         rsp = self.wc.grab_json_response(
@@ -980,7 +1043,7 @@ class XCCClient(IMMClient):
                 vid = '{0},{1}'.format(volume.id[1], volume.id[0])
                 rsp = self.wc.grab_json_response(
                     '/api/function', {'raidlink_RemoveVolumeAsync': vid})
-                if rsp['return'] != 0:
+                if rsp.get('return', -1) != 0:
                     raise Exception(
                         'Unexpected return to volume deletion: ' + repr(rsp))
                 self._wait_storage_async()
@@ -1176,6 +1239,24 @@ class XCCClient(IMMClient):
     def keepalive(self):
         self._refresh_token_wc(self._keepalivesession)
 
+    def fetch_psu_firmware(self):
+        psudata = self.get_cached_data('lenovo_cached_psu')
+        if not psudata:
+            if self.wc:
+                psudata = self.wc.grab_json_response(
+                    '/api/function/psu_update?params=GetPsuListAndFW')
+                if psudata:
+                    self.datacache['lenovo_cached_psu'] = (
+                        psudata, util._monotonic_time())
+        if not psudata:
+            return
+        for psu in psudata.get('items', ()):
+            yield ('PSU {0}'.format(psu['slot']),
+                   {
+                       'model': psu['model'],
+                       'version': psu['version'],
+                   })
+
     def get_firmware_inventory(self, bmcver, components):
         # First we fetch the system firmware found in imm properties
         # then check for agentless, if agentless, get adapter info using
@@ -1265,6 +1346,8 @@ class XCCClient(IMMClient):
                 'lxpm'))):
             for firm in self.fetch_agentless_firmware():
                 yield firm
+            for firm in self.fetch_psu_firmware():
+                yield firm
 
     def detach_remote_media(self):
         if self.webkeepalive:
@@ -1310,6 +1393,7 @@ class XCCClient(IMMClient):
 
     def upload_media(self, filename, progress=None):
         xid = random.randint(0, 1000000000)
+        self._refresh_token()
         uploadthread = webclient.FileUploader(
             self.wc, '/upload?X-Progress-ID={0}'.format(xid), filename, None)
         uploadthread.start()
@@ -1333,16 +1417,21 @@ class XCCClient(IMMClient):
                    "WebUploadName": thename}
         rsp = self.wc.grab_json_response('/api/providers/rp_rdoc_addfile',
                                          addfile)
-        if rsp['return'] != 0:
-            raise Exception('Unrecognized return: ' + repr(rsp))
+        self._refresh_token()
+        if rsp.get('return', -1) != 0:
+            errmsg = repr(rsp) if rsp else self.wc.lastjsonerror
+            raise Exception('Unrecognized return: ' + errmsg)
         rsp = self.wc.grab_json_response('/api/providers/rp_rdoc_getfiles')
         if 'items' not in rsp or len(rsp['items']) == 0:
             raise Exception(
                 'Image upload was not accepted, it may be too large')
+        self._refresh_token()
         rsp = self.wc.grab_json_response('/api/providers/rp_rdoc_mountall',
                                          {})
-        if rsp['return'] != 0:
-            raise Exception('Unrecognized return: ' + repr(rsp))
+        self._refresh_token()
+        if rsp.get('return', -1) != 0:
+            errmsg = repr(rsp) if rsp else self.wc.lastjsonerror
+            raise Exception('Unrecognized return: ' + errmsg)
         if progress:
             progress({'phase': 'complete'})
         self.weblogout()
@@ -1374,6 +1463,7 @@ class XCCClient(IMMClient):
         wc.grab_json_response('/api/providers/identity')
         if '_csrf_token' in wc.cookies:
             wc.set_header('X-XSRF-TOKEN', self.wc.cookies['_csrf_token'])
+            wc.vintage = util._monotonic_time()
 
     def set_hostname(self, hostname):
         self.wc.grab_json_response('/api/dataset', {'IMM_HostName': hostname})
@@ -1408,6 +1498,8 @@ class XCCClient(IMMClient):
                 progress({'phase': 'upload',
                           'progress': 100.0 * rsp['received'] / rsp['size']})
             elif rsp['state'] != 'done':
+                if rsp.get('status', None) == 413:
+                    raise Exception('File is larger than supported')
                 raise Exception('Unexpected result:' + repr(rsp))
             uploadstate = rsp['state']
             self._refresh_token()
@@ -1427,37 +1519,45 @@ class XCCClient(IMMClient):
         self._refresh_token()
         rsp = self.wc.grab_json_response('/api/providers/fwupdate', json.dumps(
             {'UPD_WebSetFileName': rsp['items'][0]['path']}))
-        if rsp['return'] == 25:
+        if rsp.get('return', 0) in (25, 108):
             raise Exception('Temporary error validating update, try again')
-        if rsp['return'] != 0:
-            raise Exception('Unexpected return to set filename: ' + repr(rsp))
+        if rsp.get('return', -1) != 0:
+            errmsg = repr(rsp) if rsp else self.wc.lastjsonerror
+            raise Exception('Unexpected return to set filename: ' + errmsg)
+        self._refresh_token()
         progress({'phase': 'validating',
                   'progress': 25.0})
         rsp = self.wc.grab_json_response('/api/providers/fwupdate', json.dumps(
             {'UPD_WebVerifyUploadFile': 1}))
-        if rsp['return'] == 115:
+        if rsp.get('return', 0) == 115:
             raise Exception('Update image not intended for this system')
-        if rsp['return'] != 0:
-            raise Exception('Unexpected return to verify: ' + repr(rsp))
+        elif rsp.get('return', -1) != 0:
+            errmsg = repr(rsp) if rsp else self.wc.lastjsonerror
+            raise Exception('Unexpected return to verify: ' + errmsg)
         verifystatus = 0
+        verifyuploadfilersp = None
         while verifystatus != 1:
-            rsp = self.wc.grab_json_response(
+            self._refresh_token()
+            rsp, status = self.wc.grab_json_response_with_status(
                 '/api/providers/fwupdate',
                 json.dumps({'UPD_WebVerifyUploadFileStatus': 1}))
-            if not rsp or rsp['return'] == 2:
+            if not rsp or status != 200  or rsp.get('return', -1) == 2:
                 # The XCC firmware predates the FileStatus api
+                verifyuploadfilersp = rsp
                 break
-            if rsp['return'] != 0:
+            if rsp.get('return', -1) != 0:
+                errmsg = repr(rsp) if rsp else self.wc.lastjsonerror
                 raise Exception(
-                    'Unexpected return to verifystate: {0}'.format(repr(rsp)))
+                    'Unexpected return to verifystate: {0}'.format(errmsg))
             verifystatus = rsp['status']
             if verifystatus == 2:
                 raise Exception('Failed to verify firmware image')
             if verifystatus != 1:
                 ipmisession.Session.pause(1)
             if verifystatus not in (0, 1, 255):
+                errmsg = repr(rsp) if rsp else self.wc.lastjsonerror
                 raise Exception(
-                    'Unexpected reply to verifystate: ' + repr(rsp))
+                    'Unexpected reply to verifystate: ' + errmsg)
         progress({'phase': 'validating',
                   'progress': 99.0})
         self._refresh_token()
@@ -1465,30 +1565,42 @@ class XCCClient(IMMClient):
         if len(rsp['items']) != 1:
             raise Exception('Unexpected result: ' + repr(rsp))
         firmtype = rsp['items'][0]['firmware_type']
+        if not firmtype:
+            raise Exception('Unknown firmware description returned: ' + repr(
+                rsp['items'][0]) + ' last verify return was: ' + repr(
+                    verifyuploadfilersp) + ' with code {0}'.format(status))
         if firmtype not in (
                 'TDM', 'WINDOWS DRIV', 'LINUX DRIVER', 'UEFI', 'IMM'):
             # adapter firmware
             webid = rsp['items'][0]['webfile_build_id']
             locations = webid[webid.find('[')+1:webid.find(']')]
             locations = locations.split(':')
-            if len(locations) > 1:
-                raise Exception("Multiple of the same adapter not supported")
-            validselector = locations[0].replace('#', '-')
+            validselectors = set([])
+            for loc in locations:
+                validselectors.add(loc.replace('#', '-'))
+            self._refresh_token()
             rsp = self.wc.grab_json_response(
                 '/api/function/adapter_update?params=pci_GetAdapterListAndFW')
+            foundselectors = []
             for adpitem in rsp['items']:
                 selector = '{0}-{1}'.format(adpitem['location'],
                                             adpitem['slotNo'])
-                if selector == validselector:
-                    break
+                if selector in validselectors:
+                    foundselectors.append(selector)
+                    if len(foundselectors) == len(validselectors):
+                        break
             else:
                 raise Exception('Could not find matching adapter for update')
+            self._refresh_token()
             rsp = self.wc.grab_json_response('/api/function', json.dumps(
-                {'pci_SetOOBFWSlots': selector}))
-            if rsp['return'] != 0:
+                {'pci_SetOOBFWSlots': '|'.join(foundselectors)}))
+            if rsp.get('return', -1) != 0:
+                errmsg = repr(rsp) if rsp else self.wc.lastjsonerror
                 raise Exception(
-                    'Unexpected result from PCI select: ' + repr(rsp))
+                    'Unexpected result from PCI select: ' + errmsg)
+            self.set_property('/v2/ibmc/uefi/force-inventory', 1)
         else:
+            self._refresh_token()
             rsp = self.wc.grab_json_response(
                 '/api/dataset/imm_firmware_update')
             if rsp['items'][0]['upgrades'][0]['id'] != 1:
@@ -1505,9 +1617,10 @@ class XCCClient(IMMClient):
                 '/api/providers/fwupdate', json.dumps(
                     {'UPD_WebStartOptionalAction': 2}))
 
-        if rsp['return'] != 0:
+        if rsp.get('return', -1) != 0:
+            errmsg = repr(rsp) if rsp else self.wc.lastjsonerror
             raise Exception('Unexpected result starting update: ' +
-                            rsp['return'])
+                            errmsg)
         complete = False
         while not complete:
             ipmisession.Session.pause(3)
@@ -1534,10 +1647,108 @@ class XCCClient(IMMClient):
             return 'complete'
         return 'pending'
 
+    def add_psu_hwinfo(self, hwmap):
+        psud = self.wc.grab_json_response('/api/dataset/imm_power_supplies')
+        if not psud:
+            return
+        for psus in psud['items'][0]['power']:
+            hwmap['PSU {0}'.format(psus['name'])] = {
+                'Wattage': psus['rated_power'],
+                'FRU Number': psus['fru_number'],
+            }
+
+    def augment_psu_info(self, info, psuname):
+        psud = self.get_cached_data('lenovo_cached_psuhwinfo')
+        if not psud:
+            psud = self.wc.grab_json_response('/api/dataset/imm_power_supplies')
+            if not psud:
+                return
+            self.datacache['lenovo_cached_psuhwinfo'] = (
+                psud, util._monotonic_time())
+        matchname = int(psuname.split(' ')[1])
+        for psus in psud['items'][0]['power']:
+            if psus['name'] == matchname:
+                info['Wattage'] = psus['rated_power']
+                break
+
     def get_health(self, summary):
         wc = self.get_webclient(False)
         rsp = wc.grab_json_response('/api/providers/imm_active_events')
         if 'items' in rsp and len(rsp['items']) == 0:
-            # The XCC reports healthy, no need to interrogate
-            raise pygexc.BypassGenericBehavior()
+            ledcheck = self.wc.grab_json_response(
+                '/api/dataset/imm_status_power')
+            for led in ledcheck.get('items', [{}])[0].get('LEDs', ()):
+                if led.get('name', None) == 'Fault':
+                    if led.get('status', 0) == 0:
+                        raise pygexc.BypassGenericBehavior()
+                    break
+            else:
+                # The XCC reports healthy, no need to interrogate
+                raise pygexc.BypassGenericBehavior()
+        fallbackdata = []
+        hmap = {
+            'E': pygconst.Health.Critical,
+            'W': pygconst.Health.Warning,
+        }
+        for item in rsp.get('items', ()):
+            # while usually the ipmi interrogation shall explain things,
+            # just in case there is a gap, make sure at least the
+            # health field is accurately updated
+            itemseverity = hmap.get(item.get('severity', 'E'), 'E')
+            if (summary['health'] < itemseverity):
+                summary['health'] = itemseverity
+            if item['cmnid'] == 'FQXSPPW0104J':
+                # This event does not get modeled by the sensors
+                # add a made up sensor to explain
+                summary['badreadings'].append(
+                    sdr.SensorReading({'name': item['source'],
+                                       'states': ['Not Redundant'],
+                                       'state_ids': [3],
+                                       'health': pygconst.Health.Warning,
+                                       'type': 'Power'}, ''))
+            elif item['cmnid'] == 'FQXSFMA0041K':
+                summary['badreadings'].append(
+                    sdr.SensorReading({
+                        'name': 'Optane DCPDIMM',
+                        'health': pygconst.Health.Warning,
+                        'type': 'Memory',
+                        'states': [item['message']]},
+                        '')
+                )
+            else:
+                fallbackdata.append(sdr.SensorReading({
+                    'name': item['source'],
+                    'states': [item['message']],
+                    'health': itemseverity,
+                    'type': item['source'],
+                }, ''))
+        if summary.get('health', pygconst.Health.Ok) == pygconst.Health.Ok:
+            # Fault LED is lit without explanation, mark to encourage
+            # examination
+            summary['health'] = pygconst.Health.Warning
+            if not fallbackdata:
+                fallbackdata.append(sdr.SensorReading({
+                    'name': 'Fault LED',
+                    'states': ['Active'],
+                    'health': pygconst.Health.Warning,
+                    'type': 'LED',
+                }, ''))
+        raise pygexc.FallbackData(fallbackdata)
         # Will use the generic handling for unhealthy systems
+
+    def get_licenses(self):
+        licdata = self.wc.grab_json_response('/api/providers/imm_fod')
+        for lic in licdata.get('items', [{}])[0].get('keys', []):
+            if lic['status'] == 0:
+                yield {'name': lic['feature']}
+
+    def apply_license(self, filename, progress=None):
+        uploadthread = webclient.FileUploader(self.wc, '/upload', filename)
+        uploadthread.start()
+        uploadthread.join()
+        rsp = json.loads(uploadthread.rsp)
+        licpath = rsp.get('items', [{}])[0].get('path', None)
+        if licpath:
+            self.wc.grab_json_response('/api/providers/imm_fod',
+                                       {'FOD_LicenseKeyInstall': licpath})
+        return self.get_licenses()

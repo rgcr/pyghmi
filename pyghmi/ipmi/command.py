@@ -133,7 +133,7 @@ class Command(object):
     """
 
     def __init__(self, bmc=None, userid=None, password=None, port=623,
-                 onlogon=None, kg=None, privlevel=4):
+                 onlogon=None, kg=None, privlevel=4, verifycallback=None):
         # TODO(jbjohnso): accept tuples and lists of each parameter for mass
         # operations without pushing the async complexities up the stack
         self.onlogon = onlogon
@@ -144,7 +144,7 @@ class Command(object):
         self._oemknown = False
         self._netchannel = None
         self._ipv6support = None
-        self.certverify = None
+        self.certverify = verifycallback
         if bmc is None:
             self.ipmi_session = localsession.Session()
         elif onlogon is not None:
@@ -620,7 +620,8 @@ class Command(object):
         for fruid in self._sdr.fru:
             if self._sdr.fru[fruid].fru_name == component:
                 return self._oem.process_fru(fru.FRU(
-                    ipmicmd=self, fruid=fruid, sdr=self._sdr.fru[fruid]).info)
+                    ipmicmd=self, fruid=fruid, sdr=self._sdr.fru[fruid]).info,
+                                             component)
         return self._oem.get_inventory_of_component(component)
 
     def _get_zero_fru(self):
@@ -664,7 +665,8 @@ class Command(object):
             fruinf = fru.FRU(
                 ipmicmd=self, fruid=fruid, sdr=self._sdr.fru[fruid]).info
             if fruinf is not None:
-                fruinf = self._oem.process_fru(fruinf)
+                fruinf = self._oem.process_fru(fruinf,
+                                               self._sdr.fru[fruid].fru_name)
             yield (self._sdr.fru[fruid].fru_name, fruinf)
         for componentpair in self._oem.get_oem_inventory():
             yield componentpair
@@ -701,6 +703,7 @@ class Command(object):
         warning, critical, or failed assessments.
         """
         summary = {'badreadings': [], 'health': const.Health.Ok}
+        fallbackreadings = []
         try:
             self.oem_init()
             self._oem.get_health(summary)
@@ -710,6 +713,9 @@ class Command(object):
                     summary['badreadings'].append(reading)
         except exc.BypassGenericBehavior:
             pass
+        except exc.FallbackData as fd:
+            if not summary['badreadings']:
+                summary['badreadings'] = fd.fallbackdata
         return summary
 
     def get_sensor_reading(self, sensorname):
@@ -1584,6 +1590,9 @@ class Command(object):
             'proprietary': 5,
             'no_access': 0x0F,
         }
+        self.oem_init()
+        self._oem.set_user_access(
+            uid, channel, callback, link_auth, ipmi_msg, privilege_level)
         data = [b, uid & 0b00111111,
                 privilege_levels[privilege_level] & 0b00001111, 0]
         response = self.raw_command(netfn=0x06, command=0x43, data=data)
@@ -1822,11 +1831,11 @@ class Command(object):
         if channel is None:
             channel = self.get_network_channel()
         self.set_user_name(uid, name)
+        self.set_user_password(uid, password=password)
+        self.set_user_password(uid, mode='enable', password=password)
         self.set_user_access(uid, channel, callback=callback,
                              link_auth=link_auth, ipmi_msg=ipmi_msg,
                              privilege_level=privilege_level)
-        self.set_user_password(uid, password=password)
-        self.set_user_password(uid, mode='enable', password=password)
         return True
 
     def user_delete(self, uid, channel=None):
@@ -1980,3 +1989,11 @@ class Command(object):
         """
         self.oem_init()
         return self._oem.list_media()
+
+    def get_licenses(self):
+        self.oem_init()
+        return self._oem.get_licenses()
+
+    def apply_license(self, filename, progress=None):
+        self.oem_init()
+        return self._oem.apply_license(filename, progress)

@@ -326,6 +326,11 @@ class OEMHandler(generic.OEMHandler):
             return True
         return None
 
+    def set_user_access(self, uid, channel, callback, link_auth, ipmi_msg,
+                        privilege_level):
+        if self.is_fpc and  self._fpc_variant == 2:
+            self.smmhandler.set_user_priv(uid, privilege_level)
+
     @property
     def is_fpc(self):
         """True if the target is a Lenovo nextscale fan power controller
@@ -487,7 +492,7 @@ class OEMHandler(generic.OEMHandler):
         else:
             raise pygexc.UnsupportedFunctionality()
 
-    def process_fru(self, fru):
+    def process_fru(self, fru, name=None):
         if fru is None:
             return fru
         if self.has_tsm:
@@ -551,6 +556,8 @@ class OEMHandler(generic.OEMHandler):
                     idx = idx + 6
             except (AttributeError, KeyError, IndexError):
                 pass
+            if self.has_xcc and name and name.startswith('PSU '):
+                self.immhandler.augment_psu_info(fru, name)
             return fru
         elif self.is_fpc == 2:  # SMM variant
             fru['oem_parser'] = 'lenovo'
@@ -609,7 +616,7 @@ class OEMHandler(generic.OEMHandler):
         elif self.is_fpc:
             return nextscale.get_fpc_firmware(bmcver, self.ipmicmd,
                                               self._fpc_variant)
-        return super(OEMHandler, self).get_oem_firmware(bmcver)
+        return super(OEMHandler, self).get_oem_firmware(bmcver, components)
 
     def get_diagnostic_data(self, savefile, progress):
         if self.has_xcc:
@@ -966,3 +973,13 @@ class OEMHandler(generic.OEMHandler):
         if self.has_xcc:
             return self.immhandler.get_health(summary)
         return super(OEMHandler, self).get_health(summary)
+
+    def get_licenses(self):
+        if self.has_xcc:
+            return self.immhandler.get_licenses()
+        return super(OEMHandler, self).get_licenses()
+
+    def apply_license(self, filename, progress=None):
+        if self.has_xcc:
+            return self.immhandler.apply_license(filename, progress)
+        return super(OEMHandler, self).apply_license(filename, progress)

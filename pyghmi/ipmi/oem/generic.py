@@ -167,7 +167,7 @@ class OEMHandler(object):
         """
         return None
 
-    def process_fru(self, fru):
+    def process_fru(self, fru, name=None):
         """Modify a fru entry with OEM understanding.
 
         Given a fru, clarify 'extra' fields according to OEM rules and
@@ -316,6 +316,10 @@ class OEMHandler(object):
         """
         raise exc.UnsupportedFunctionality()
 
+    def set_user_access(self, uid, channel, callback, link_auth, ipmi_msg,
+                        privilege_level):
+        return  # Nothing to do
+
     def set_alert_ipv6_destination(self, ip, destination, channel):
         """Set an IPv6 alert destination
 
@@ -347,4 +351,10 @@ class OEMHandler(object):
 
         Takes a key value pair and applies it against the system configuration
         """
+        raise exc.UnsupportedFunctionality()
+
+    def get_licenses(self):
+        raise exc.UnsupportedFunctionality()
+
+    def apply_license(self, filename, progress=None):
         raise exc.UnsupportedFunctionality()
